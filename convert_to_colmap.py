@@ -77,7 +77,7 @@ def get_posed_images(provider, mps_traj, stream_id, start_idx=0, num_data=100):
         yield image_data, extrinsics
 
 
-def get_pcd_visibility_from_mps(mps_data_dir):
+def get_pcd_visibility_from_mps(mps_data_dir, timestamp_ns_min=0, timestamp_ns_max=1e12):
     observations_path = mps_data_dir / "semidense_observations.csv.gz"
     # WARN: this is known to be slow
     print(f"Reading MPS point cloud visibility from {observations_path}...")
@@ -89,9 +89,21 @@ def get_pcd_visibility_from_mps(mps_data_dir):
     # we convert it to a dataframe with the same attributes for easier querying
     # columns = [name for name in dir(
     #     observations[0]) if not name.startswith('_')]
+
+    # TODO: we should only load data near target timestamp
+
     columns = ['frame_capture_timestamp', 'point_uid']
-    obs_dict = {col: [getattr(obs, col)
-                      for obs in observations] for col in columns}
+    # obs_dict = {col: [getattr(obs, col)
+    #                   for obs in observations] for col in columns}
+    obs_dict = {col: [] for col in columns}
+
+    for obs in observations:
+        if timestamp_ns_max / 1e9 < obs.frame_capture_timestamp.total_seconds():
+            break
+        if timestamp_ns_min / 1e9 <= obs.frame_capture_timestamp.total_seconds():
+            obs_dict['frame_capture_timestamp'].append(
+                obs.frame_capture_timestamp)
+            obs_dict['point_uid'].append(obs.point_uid)
     # obs_dict['u'] = [obs.uv[0] for obs in observations]
     # obs_dict['v'] = [obs.uv[1] for obs in observations]
     obs_df = pd.DataFrame.from_dict(obs_dict)
@@ -168,13 +180,15 @@ def main(vrs_file: Path, mps_data_dir: Path, output_dir: Path, start_idx=0, num_
     # Second, there is no color on points, which is a problem for 3DGS initialization
     # TODO: after camera pos is added, we add 3D points, and figure out the visibility by projection,
     # and take the color as the mean color of visible pixels
-    pcd, pcd_uid = get_pcd_from_mps(mps_data_dir)
-
+    # pcd, pcd_uid = get_pcd_from_mps(mps_data_dir)
+    pcd_visibility = None
     # use official visibility from MPS. WARN: this is known to be slow
-    pcd_visibility = get_pcd_visibility_from_mps(mps_data_dir)
-
-    pcd_is_visible = np.zeros(len(pcd), dtype=bool)
-    pcd_colors = np.zeros((len(pcd), 3), dtype=np.uint8)
+    # pcd_visibility = get_pcd_visibility_from_mps(mps_data_dir)
+    # pcd, pcd_uid = get_pcd_from_mps(mps_data_dir)
+    # pcd_visibility = None
+    # pcd_is_visible = np.zeros(len(pcd), dtype=bool)
+    # pcd_colors = np.zeros((len(pcd), 3), dtype=np.uint8)
+    add_pcd = True
 
     img_save_dir = output_dir / "images"
     img_save_dir.mkdir(exist_ok=True)
@@ -184,6 +198,13 @@ def main(vrs_file: Path, mps_data_dir: Path, output_dir: Path, start_idx=0, num_
 
     for idx, (image_data, extrinsics_device) in tqdm(enumerate(get_posed_images(provider, mps_traj, stream_id,
                                                                                 start_idx, num_data)),):
+        if pcd_visibility is None and add_pcd:
+            pcd_visibility = get_pcd_visibility_from_mps(mps_data_dir, timestamp_ns_min=image_data[1].capture_timestamp_ns,
+                                                         timestamp_ns_max=image_data[1].capture_timestamp_ns + 1e10)
+            pcd, pcd_uid = get_pcd_from_mps(mps_data_dir)
+            pcd_is_visible = np.zeros(len(pcd), dtype=bool)
+            pcd_colors = np.zeros((len(pcd), 3), dtype=np.uint8)
+
         # undistort the image
         rectified_array = aria_core.calibration.distort_by_calibration(
             image_data[0].to_numpy_array(),
@@ -214,39 +235,40 @@ def main(vrs_file: Path, mps_data_dir: Path, output_dir: Path, start_idx=0, num_
             )
         )
         colmap_im.registered = True
+        if add_pcd:
+            # Retrieve visibility information from MPS result
+            # pcd_2d is visible keypoint uv coordinate on the image,
+            # it corresponds to the pcd_visible_idx in all pointclouds
+            pcd_potential_visible_idx = find_visible_pcd_this_frame(
+                pcd_uid, pcd_visibility, image_data[1].capture_timestamp_ns)
 
-        # Retrieve visibility information from MPS result
-        # pcd_2d is visible keypoint uv coordinate on the image,
-        # it corresponds to the pcd_visible_idx in all pointclouds
-        pcd_potential_visible_idx = find_visible_pcd_this_frame(
-            pcd_uid, pcd_visibility, image_data[1].capture_timestamp_ns)
+            pcd_potential_visible = pcd[pcd_potential_visible_idx]
 
-        pcd_potential_visible = pcd[pcd_potential_visible_idx]
+            pcd_potential_visible_is_visible, pcd_2d_xy = test_pts_in_cam(
+                pcd_potential_visible, colmap_im.cam_from_world, colmap_cam, tgt_img_size)
 
-        pcd_potential_visible_is_visible, pcd_2d_xy = test_pts_in_cam(
-            pcd_potential_visible, colmap_im.cam_from_world, colmap_cam, tgt_img_size)
+            pcd_is_visible_this_frame = np.zeros(len(pcd), dtype=bool)
+            pcd_is_visible_this_frame[pcd_potential_visible_idx[pcd_potential_visible_is_visible]] = True
 
-        pcd_is_visible_this_frame = np.zeros(len(pcd), dtype=bool)
-        pcd_is_visible_this_frame[pcd_potential_visible_idx[pcd_potential_visible_is_visible]] = True
+            pcd_is_visible |= pcd_is_visible_this_frame
+            pcd_colors[pcd_is_visible_this_frame] = rectified_array[pcd_2d_xy[:, 1], pcd_2d_xy[:, 0]]
 
-        pcd_is_visible |= pcd_is_visible_this_frame
-        pcd_colors[pcd_is_visible_this_frame] = rectified_array[pcd_2d_xy[:, 1], pcd_2d_xy[:, 0]]
-
-        # added the most updated visibility relation
-        colmap_im.points2D = pycolmap.ListPoint2D(
-            [pycolmap.Point2D(p, id_) for p, id_ in zip(
-                pcd_2d_xy, np.nonzero(pcd_is_visible_this_frame)[0])],
-        )
+            # added the most updated visibility relation
+            colmap_im.points2D = pycolmap.ListPoint2D(
+                [pycolmap.Point2D(p, id_) for p, id_ in zip(
+                    pcd_2d_xy, np.nonzero(pcd_is_visible_this_frame)[0])],
+            )
         rec.add_image(colmap_im)
 
     # collect visible points, and add them to COLMAP
-    print('adding visible points to COLMAP...')
-    pcd_visible = pcd[pcd_is_visible]
-    pcd_colors_visible = pcd_colors[pcd_is_visible].clip(
-        0, 255).astype(np.uint8)
-    print(f'Found {len(pcd_visible)} visible points in total.')
-    for point, color in zip(pcd_visible, pcd_colors_visible):
-        rec.add_point3D(point, pycolmap.Track(), color)
+    if add_pcd:
+        print('adding visible points to COLMAP...')
+        pcd_visible = pcd[pcd_is_visible]
+        pcd_colors_visible = pcd_colors[pcd_is_visible].clip(
+            0, 255).astype(np.uint8)
+        print(f'Found {len(pcd_visible)} visible points in total.')
+        for point, color in zip(pcd_visible, pcd_colors_visible):
+            rec.add_point3D(point, pycolmap.Track(), color)
 
     output_model_dir = output_dir / "sparse/0"
     output_model_dir.mkdir(parents=True, exist_ok=True)
@@ -271,6 +293,7 @@ def main(vrs_file: Path, mps_data_dir: Path, output_dir: Path, start_idx=0, num_
 
     # save to COLMAP results
     rec.write(str(output_model_dir))
+    rec.write_text(str(output_model_dir))
 
 
 if __name__ == "__main__":
